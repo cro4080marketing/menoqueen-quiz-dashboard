@@ -1,7 +1,9 @@
 import os
 import json
 import re
-from datetime import date, timedelta
+import threading
+import time as _time
+from datetime import date, datetime, timedelta
 from collections import Counter
 from urllib.parse import urlparse, parse_qs
 
@@ -39,6 +41,11 @@ GA4_CREDENTIALS_JSON = os.environ.get("GA4_CREDENTIALS_JSON", "")
 SHOPIFY_STORE_DOMAIN = os.environ.get("SHOPIFY_STORE_DOMAIN", "")
 SHOPIFY_ACCESS_TOKEN = os.environ.get("SHOPIFY_ACCESS_TOKEN", "")
 SHOPIFY_API_VERSION = os.environ.get("SHOPIFY_API_VERSION", "2024-10")
+
+# Slack daily report
+SLACK_WEBHOOK_URL = os.environ.get("SLACK_WEBHOOK_URL", "")
+SLACK_REPORT_HOUR = int(os.environ.get("SLACK_REPORT_HOUR", "8"))
+SLACK_REPORT_TIMEZONE = os.environ.get("SLACK_REPORT_TIMEZONE", "Europe/London")
 
 # ---------------------------------------------------------------------------
 # Quiz metadata
@@ -988,6 +995,7 @@ def render_sidebar():
             ("GA4", _ga4_available()),
             ("Shopify", _shopify_available()),
             ("Claude AI", bool(ANTHROPIC_API_KEY)),
+            ("Slack Reports", bool(SLACK_WEBHOOK_URL)),
         ]
         for name, connected in sources:
             dot_class = "connected" if connected else "disconnected"
@@ -1673,11 +1681,52 @@ def render_ai_page(
 
 
 # =========================================================================
+#  SLACK DAILY REPORT SCHEDULER
+# =========================================================================
+
+_slack_scheduler_started = False
+
+def _start_slack_scheduler():
+    """Start a background thread that sends a daily Slack report."""
+    global _slack_scheduler_started
+    if _slack_scheduler_started or not SLACK_WEBHOOK_URL:
+        return
+    _slack_scheduler_started = True
+
+    def _scheduler_loop():
+        from zoneinfo import ZoneInfo
+        tz = ZoneInfo(SLACK_REPORT_TIMEZONE)
+        last_sent_date = None
+
+        while True:
+            now = datetime.now(tz)
+            today = now.date()
+
+            if now.hour == SLACK_REPORT_HOUR and last_sent_date != today:
+                try:
+                    from slack_report import send_daily_report
+                    send_daily_report()
+                    last_sent_date = today
+                except Exception as e:
+                    print(f"[slack_scheduler] Error: {e}")
+                    # Retry in 10 minutes
+                    _time.sleep(600)
+                    continue
+
+            _time.sleep(60)  # Check every minute
+
+    t = threading.Thread(target=_scheduler_loop, daemon=True)
+    t.start()
+    print(f"[slack_scheduler] Started — will send at {SLACK_REPORT_HOUR}:00 {SLACK_REPORT_TIMEZONE}")
+
+
+# =========================================================================
 #  MAIN
 # =========================================================================
 
 def main():
     inject_css()
+    _start_slack_scheduler()
 
     if not KLAVIYO_API_KEY:
         st.error("**KLAVIYO_API_KEY** environment variable is not set.")
