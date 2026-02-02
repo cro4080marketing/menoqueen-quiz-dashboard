@@ -1111,7 +1111,7 @@ def render_dashboard_page(df: pd.DataFrame, ga4_steps: dict | None, shopify_metr
 #  PAGE 2: DROP-OFF REPORT
 # =========================================================================
 
-def render_dropoff_page(df: pd.DataFrame, ga4_steps: dict | None):
+def render_dropoff_page(df: pd.DataFrame, ga4_steps: dict | None, ga4_error: str | None = None):
     st.markdown('<div class="page-title">\U0001f6a8 Drop-off Report</div>', unsafe_allow_html=True)
     st.markdown('<div class="page-subtitle">Identify where users leave the quiz and what needs attention</div>', unsafe_allow_html=True)
 
@@ -1121,7 +1121,7 @@ def render_dropoff_page(df: pd.DataFrame, ga4_steps: dict | None):
         _render_full_funnel_waterfall(df, ga4_steps)
 
     with tab_ga4:
-        _render_ga4_funnel_tab(ga4_steps)
+        _render_ga4_funnel_tab(ga4_steps, ga4_error)
 
     with tab_klaviyo:
         _render_klaviyo_funnel_tab(df)
@@ -1194,16 +1194,8 @@ def _render_full_funnel_waterfall(df: pd.DataFrame, ga4_steps: dict | None):
         if step["ga4_count"] and step["ga4_count"] > 0:
             ga4_html = f' &nbsp;|&nbsp; <span class="source-badge source-badge--ga4">GA4</span> {step["ga4_count"]:,} pageviews'
 
-        st.markdown(f"""
-        <div class="step-card step-card--{sev}">
-            <div class="step-name">{step["label"]}{badge_html}</div>
-            <div class="step-counts">
-                <span class="source-badge source-badge--klaviyo">Klaviyo</span>
-                {step["count"]:,} profiles ({step["pct"]}%)
-                {ga4_html}
-            </div>
-        </div>
-        """, unsafe_allow_html=True)
+        card_html = f'<div class="step-card step-card--{sev}"><div class="step-name">{step["label"]}{badge_html}</div><div class="step-counts"><span class="source-badge source-badge--klaviyo">Klaviyo</span> {step["count"]:,} profiles ({step["pct"]}%){ga4_html}</div></div>'
+        st.markdown(card_html, unsafe_allow_html=True)
 
     # -- Drop-off Heatmap --
     st.markdown("<br>", unsafe_allow_html=True)
@@ -1231,12 +1223,20 @@ def _render_full_funnel_waterfall(df: pd.DataFrame, ga4_steps: dict | None):
         st.plotly_chart(fig, use_container_width=True)
 
 
-def _render_ga4_funnel_tab(ga4_steps: dict | None):
+def _render_ga4_funnel_tab(ga4_steps: dict | None, ga4_error: str | None = None):
     if not ga4_steps:
-        st.info(
-            "**GA4 not connected.** Add `GA4_PROPERTY_ID` and `GA4_CREDENTIALS_JSON` "
-            "environment variables to see anonymous visitor data."
-        )
+        if ga4_error:
+            st.warning(f"**GA4 connection error:** {ga4_error}")
+        elif _ga4_available():
+            st.info(
+                "**GA4 connected but no data yet.** Pageview data can take 24-48 hours "
+                "to appear after GA4 setup. Try again later."
+            )
+        else:
+            st.info(
+                "**GA4 not connected.** Add `GA4_PROPERTY_ID` and `GA4_CREDENTIALS_JSON` "
+                "environment variables to see anonymous visitor data."
+            )
         return
 
     records = []
@@ -1261,7 +1261,7 @@ def _render_ga4_funnel_tab(ga4_steps: dict | None):
     ))
     apply_chart_theme(fig)
     fig.update_layout(height=max(350, n * 36))
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, use_container_width=True, key="ga4_funnel_chart")
 
 
 def _render_klaviyo_funnel_tab(df: pd.DataFrame):
@@ -1281,7 +1281,7 @@ def _render_klaviyo_funnel_tab(df: pd.DataFrame):
     ))
     apply_chart_theme(fig)
     fig.update_layout(height=max(400, n * 36))
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, use_container_width=True, key="klaviyo_funnel_chart")
 
 
 # =========================================================================
@@ -1300,27 +1300,27 @@ def render_responses_page(df: pd.DataFrame):
     with tab_key:
         col_l, col_r = st.columns(2)
         with col_l:
-            _render_question_chart(df, "quiz_q1", "Primary Symptom (Q1)", chart_type="hbar")
+            _render_question_chart(df, "quiz_q1", "Primary Symptom (Q1)", chart_type="hbar", key_prefix="key")
         with col_r:
-            _render_question_chart(df, "quiz_q9", "Menopause Stage (Q9)", chart_type="donut")
+            _render_question_chart(df, "quiz_q9", "Menopause Stage (Q9)", chart_type="donut", key_prefix="key")
 
         col_l2, col_r2 = st.columns(2)
         with col_l2:
-            _render_question_chart(df, "quiz_q10", "Age Range (Q10)", chart_type="bar")
+            _render_question_chart(df, "quiz_q10", "Age Range (Q10)", chart_type="bar", key_prefix="key")
         with col_r2:
-            _render_question_chart(df, "quiz_q12", "Relief Status (Q12)", chart_type="donut")
+            _render_question_chart(df, "quiz_q12", "Relief Status (Q12)", chart_type="donut", key_prefix="key")
 
     with tab_health:
         for qk in Q_HEALTH:
-            _render_question_chart(df, qk, f"{QUESTION_LABELS[qk]} ({qk.replace('quiz_', '').upper()})", chart_type="hbar")
+            _render_question_chart(df, qk, f"{QUESTION_LABELS[qk]} ({qk.replace('quiz_', '').upper()})", chart_type="hbar", key_prefix="health")
 
     with tab_lifestyle:
         for qk in Q_LIFESTYLE:
-            _render_question_chart(df, qk, f"{QUESTION_LABELS[qk]} ({qk.replace('quiz_', '').upper()})", chart_type="hbar")
+            _render_question_chart(df, qk, f"{QUESTION_LABELS[qk]} ({qk.replace('quiz_', '').upper()})", chart_type="hbar", key_prefix="lifestyle")
 
     with tab_demo:
         for qk in Q_DEMOGRAPHICS:
-            _render_question_chart(df, qk, f"{QUESTION_LABELS[qk]} ({qk.replace('quiz_', '').upper()})", chart_type="bar")
+            _render_question_chart(df, qk, f"{QUESTION_LABELS[qk]} ({qk.replace('quiz_', '').upper()})", chart_type="bar", key_prefix="demo")
 
     with tab_all:
         for qk in QUIZ_Q_KEYS:
@@ -1339,16 +1339,18 @@ def render_responses_page(df: pd.DataFrame):
                     showlegend=False, coloraxis_showscale=False,
                     yaxis=dict(autorange="reversed"),
                 )
-                st.plotly_chart(fig, use_container_width=True)
+                st.plotly_chart(fig, use_container_width=True, key=f"all_{qk}")
 
 
-def _render_question_chart(df: pd.DataFrame, col: str, title: str, chart_type: str = "hbar"):
+def _render_question_chart(df: pd.DataFrame, col: str, title: str, chart_type: str = "hbar", key_prefix: str = ""):
     """Render a single question chart with dark theme."""
     st.markdown(f'<div class="chart-title">{title}</div>', unsafe_allow_html=True)
     dist = compute_answer_distribution(df, col)
     if dist.empty:
         st.info("No data yet.")
         return
+
+    chart_key = f"{key_prefix}_{col}_{chart_type}" if key_prefix else f"{col}_{chart_type}"
 
     if chart_type == "hbar":
         fig = px.bar(
@@ -1382,7 +1384,7 @@ def _render_question_chart(df: pd.DataFrame, col: str, title: str, chart_type: s
     else:
         return
 
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, use_container_width=True, key=chart_key)
 
 
 # =========================================================================
@@ -1697,11 +1699,12 @@ def main():
 
     # -- Fetch GA4 data (optional) --
     ga4_steps = None
+    ga4_error = None
     if _ga4_available():
         try:
             ga4_steps = fetch_ga4_step_pageviews()
-        except Exception:
-            pass
+        except Exception as e:
+            ga4_error = str(e)
 
     # -- Fetch Shopify data (optional) --
     shopify_orders = None
@@ -1717,7 +1720,7 @@ def main():
     if "\U0001f4ca" in page:  # Dashboard
         render_dashboard_page(df, ga4_steps, shopify_metrics)
     elif "\U0001f6a8" in page:  # Drop-off Report
-        render_dropoff_page(df, ga4_steps)
+        render_dropoff_page(df, ga4_steps, ga4_error=ga4_error)
     elif "\U0001f465" in page:  # Quiz Responses
         render_responses_page(df)
     elif "\U0001f4b0" in page:  # Shopify Impact
