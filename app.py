@@ -1,4 +1,5 @@
 import os
+from datetime import date, timedelta
 import streamlit as st
 import requests
 import pandas as pd
@@ -412,14 +413,23 @@ def render_raw_data(df: pd.DataFrame):
 # AI Insights (Claude via Anthropic API)
 # ---------------------------------------------------------------------------
 
-def build_data_summary(df: pd.DataFrame) -> str:
-    """Build a concise text snapshot of all quiz data for the AI prompt."""
+def _filter_by_dates(df: pd.DataFrame, start: date, end: date) -> pd.DataFrame:
+    """Return rows whose `created` date falls within [start, end] inclusive."""
+    if df.empty or df["created"].isna().all():
+        return df
+    mask = (df["created"].dt.date >= start) & (df["created"].dt.date <= end)
+    return df.loc[mask]
+
+
+def build_data_summary(df: pd.DataFrame, label: str = "") -> str:
+    """Build a concise text snapshot of a (possibly filtered) DataFrame."""
     total = len(df)
     emails = int((df["email"] != "").sum()) if not df.empty else 0
     completed = int(df["quiz_completed"].sum()) if not df.empty else 0
 
+    header = f"=== {label} ===" if label else "=== MenoQueen Quiz Data Snapshot ==="
     lines = [
-        "=== MenoQueen Quiz Data Snapshot ===",
+        header,
         f"Total profiles: {total}",
         f"Emails captured: {emails} ({round(emails/total*100,1) if total else 0}%)",
         f"Completed: {completed} ({round(completed/total*100,1) if total else 0}%)",
@@ -429,7 +439,7 @@ def build_data_summary(df: pd.DataFrame) -> str:
     # Funnel with step-to-step drop-offs
     funnel = compute_funnel(df)
     if not funnel.empty:
-        lines.append("=== Funnel (step → count → drop-off from previous) ===")
+        lines.append("Funnel (step | count | drop-off from previous):")
         prev = None
         for _, row in funnel.iterrows():
             drop = ""
@@ -441,22 +451,72 @@ def build_data_summary(df: pd.DataFrame) -> str:
         lines.append("")
 
     # Answer distributions per question
-    lines.append("=== Answer Distributions ===")
+    lines.append("Answer Distributions:")
     for qk in QUIZ_Q_KEYS:
-        label = QUESTION_LABELS.get(qk, qk)
+        qlabel = QUESTION_LABELS.get(qk, qk)
         dist = compute_answer_distribution(df, qk)
         if dist.empty:
             continue
-        lines.append(f"\n{label} ({qk}):")
+        lines.append(f"\n  {qlabel} ({qk}):")
         for _, r in dist.iterrows():
             pct = round(r["count"] / total * 100, 1) if total else 0
-            lines.append(f"  {r['answer']}: {r['count']} ({pct}%)")
+            lines.append(f"    {r['answer']}: {r['count']} ({pct}%)")
 
     return "\n".join(lines)
 
 
-def get_claude_insights(summary: str) -> str:
+def build_comparison_summary(
+    df: pd.DataFrame,
+    start_a: date, end_a: date,
+    start_b: date, end_b: date,
+) -> str:
+    """Build side-by-side summaries for two date ranges."""
+    df_a = _filter_by_dates(df, start_a, end_a)
+    df_b = _filter_by_dates(df, start_b, end_b)
+    label_a = f"PERIOD A: {start_a.strftime('%b %d')} – {end_a.strftime('%b %d, %Y')} ({len(df_a)} profiles)"
+    label_b = f"PERIOD B: {start_b.strftime('%b %d')} – {end_b.strftime('%b %d, %Y')} ({len(df_b)} profiles)"
+    return build_data_summary(df_a, label_a) + "\n\n" + build_data_summary(df_b, label_b)
+
+
+def get_claude_insights(
+    summary: str,
+    mode: str = "snapshot",
+    custom_question: str = "",
+) -> str:
     """Call the Anthropic Messages API and return Claude's analysis."""
+    system_prompt = (
+        "You are a quiz funnel conversion analyst for MenoQueen, a menopause "
+        "supplement brand. You analyze quiz completion data and provide actionable "
+        "insights. Be specific, reference actual numbers from the data, and "
+        "prioritize recommendations by potential revenue impact. Keep your analysis "
+        "concise. Format with markdown headers (##) and bullet points."
+    )
+
+    if mode == "comparison":
+        user_content = (
+            "Compare these two time periods of quiz funnel data.\n"
+            "Period A is the BASELINE (the earlier / 'good' period).\n"
+            "Period B is the RECENT period (the one the client is concerned about).\n\n"
+            "Identify:\n"
+            "1. Key metric changes between the periods (completion rate, email capture rate, drop-off shifts)\n"
+            "2. Which funnel steps got worse (or better) and by how much\n"
+            "3. Any shifts in answer distributions that could explain behaviour changes\n"
+            "4. 3-5 specific, prioritised recommendations to fix any declines\n\n"
+        )
+    else:
+        user_content = (
+            "Analyze this quiz funnel data. Identify:\n"
+            "1. The biggest drop-off points and likely causes\n"
+            "2. Patterns in who completes vs. who drops off\n"
+            "3. What the symptom/answer distributions reveal about the audience\n"
+            "4. 3-5 specific, actionable recommendations to improve conversion\n\n"
+        )
+
+    if custom_question:
+        user_content += f"The client specifically wants to know: \"{custom_question}\"\n\n"
+
+    user_content += summary
+
     resp = requests.post(
         "https://api.anthropic.com/v1/messages",
         headers={
@@ -466,39 +526,39 @@ def get_claude_insights(summary: str) -> str:
         },
         json={
             "model": "claude-sonnet-4-20250514",
-            "max_tokens": 1500,
-            "system": (
-                "You are a quiz funnel conversion analyst for MenoQueen, a menopause "
-                "supplement brand. You analyze quiz completion data and provide actionable "
-                "insights. Be specific, reference actual numbers from the data, and "
-                "prioritize recommendations by potential revenue impact. Keep your analysis "
-                "concise. Format with markdown headers (##) and bullet points."
-            ),
-            "messages": [
-                {
-                    "role": "user",
-                    "content": (
-                        "Analyze this quiz funnel data. Identify:\n"
-                        "1. The biggest drop-off points and likely causes\n"
-                        "2. Patterns in who completes vs. who drops off\n"
-                        "3. What the symptom/answer distributions reveal about the audience\n"
-                        "4. 3-5 specific, actionable recommendations to improve conversion\n\n"
-                        f"{summary}"
-                    ),
-                }
-            ],
+            "max_tokens": 2000,
+            "system": system_prompt,
+            "messages": [{"role": "user", "content": user_content}],
         },
         timeout=60,
     )
     resp.raise_for_status()
     data = resp.json()
-    # Extract text from the first content block
     blocks = data.get("content", [])
     return blocks[0]["text"] if blocks else "No response received."
 
 
+def _run_analysis(summary: str, mode: str, custom_question: str):
+    """Shared helper: call Claude and store result (or show error)."""
+    try:
+        insights = get_claude_insights(summary, mode=mode, custom_question=custom_question)
+        st.session_state["ai_insights"] = insights
+    except requests.exceptions.HTTPError as exc:
+        status = exc.response.status_code
+        if status == 401:
+            st.error("Invalid Anthropic API key. Check your ANTHROPIC_API_KEY.")
+        elif status == 429:
+            st.error("Rate limited by Anthropic API. Wait a moment and try again.")
+        else:
+            st.error(f"Anthropic API error: {status} – {exc.response.text[:300]}")
+    except requests.exceptions.Timeout:
+        st.error("Claude API request timed out. Try again.")
+    except Exception as exc:
+        st.error(f"Unexpected error: {exc}")
+
+
 def render_ai_insights(df: pd.DataFrame):
-    """Render the AI Insights section with an on-demand Analyze button."""
+    """Render AI Insights with Snapshot and Comparison modes."""
     st.subheader("AI Insights")
 
     if not ANTHROPIC_API_KEY:
@@ -508,30 +568,107 @@ def render_ai_insights(df: pd.DataFrame):
         )
         return
 
-    if st.button("Analyze with Claude"):
-        with st.spinner("Claude is analyzing your quiz data..."):
-            try:
-                summary = build_data_summary(df)
-                insights = get_claude_insights(summary)
-                st.session_state["ai_insights"] = insights
-            except requests.exceptions.HTTPError as exc:
-                status = exc.response.status_code
-                if status == 401:
-                    st.error("Invalid Anthropic API key. Check your ANTHROPIC_API_KEY.")
-                elif status == 429:
-                    st.error("Rate limited by Anthropic API. Wait a moment and try again.")
+    mode = st.radio(
+        "Analysis type",
+        ["Snapshot", "Comparison"],
+        horizontal=True,
+        key="ai_mode",
+    )
+
+    today = date.today()
+
+    if mode == "Snapshot":
+        col_s, col_e = st.columns(2)
+        with col_s:
+            snap_start = st.date_input("From", value=today - timedelta(days=30), key="snap_start")
+        with col_e:
+            snap_end = st.date_input("To", value=today, key="snap_end")
+
+        custom_q = st.text_input(
+            "Question for Claude (optional)",
+            placeholder="e.g. Why is the drop-off so high after email capture?",
+            key="snap_question",
+        )
+
+        if st.button("Analyze with Claude", key="btn_snap"):
+            with st.spinner("Claude is analyzing your quiz data..."):
+                filtered = _filter_by_dates(df, snap_start, snap_end)
+                if filtered.empty:
+                    st.warning("No profiles in that date range.")
                 else:
-                    st.error(f"Anthropic API error: {status} – {exc.response.text[:300]}")
-                return
-            except requests.exceptions.Timeout:
-                st.error("Claude API request timed out. Try again.")
-                return
-            except Exception as exc:
-                st.error(f"Unexpected error: {exc}")
-                return
+                    summary = build_data_summary(
+                        filtered,
+                        f"{snap_start.strftime('%b %d')} – {snap_end.strftime('%b %d, %Y')} ({len(filtered)} profiles)",
+                    )
+                    _run_analysis(summary, "snapshot", custom_q)
+
+    else:  # Comparison
+        # Quick presets
+        st.caption("Quick presets")
+        p1, p2, _ = st.columns([1, 1, 2])
+        with p1:
+            if st.button("Last 7d vs Previous 7d", key="preset_7d"):
+                st.session_state["a_start"] = today - timedelta(days=14)
+                st.session_state["a_end"] = today - timedelta(days=8)
+                st.session_state["b_start"] = today - timedelta(days=7)
+                st.session_state["b_end"] = today
+        with p2:
+            if st.button("This month vs Last month", key="preset_month"):
+                first_this = today.replace(day=1)
+                last_month_end = first_this - timedelta(days=1)
+                last_month_start = last_month_end.replace(day=1)
+                st.session_state["a_start"] = last_month_start
+                st.session_state["a_end"] = last_month_end
+                st.session_state["b_start"] = first_this
+                st.session_state["b_end"] = today
+
+        # Period A
+        st.markdown("**Period A** (baseline / earlier)")
+        a1, a2 = st.columns(2)
+        with a1:
+            a_start = st.date_input(
+                "Start", value=st.session_state.get("a_start", today - timedelta(days=14)),
+                key="a_start",
+            )
+        with a2:
+            a_end = st.date_input(
+                "End", value=st.session_state.get("a_end", today - timedelta(days=8)),
+                key="a_end",
+            )
+
+        # Period B
+        st.markdown("**Period B** (recent / concerning)")
+        b1, b2 = st.columns(2)
+        with b1:
+            b_start = st.date_input(
+                "Start", value=st.session_state.get("b_start", today - timedelta(days=7)),
+                key="b_start",
+            )
+        with b2:
+            b_end = st.date_input(
+                "End", value=st.session_state.get("b_end", today),
+                key="b_end",
+            )
+
+        custom_q = st.text_input(
+            "Question for Claude (optional)",
+            placeholder="e.g. Why did our completion rate drop this week?",
+            key="cmp_question",
+        )
+
+        if st.button("Compare with Claude", key="btn_cmp"):
+            with st.spinner("Claude is comparing the two periods..."):
+                df_a = _filter_by_dates(df, a_start, a_end)
+                df_b = _filter_by_dates(df, b_start, b_end)
+                if df_a.empty and df_b.empty:
+                    st.warning("No profiles in either date range.")
+                else:
+                    summary = build_comparison_summary(df, a_start, a_end, b_start, b_end)
+                    _run_analysis(summary, "comparison", custom_q)
 
     # Display persisted result
     if "ai_insights" in st.session_state:
+        st.divider()
         st.markdown(st.session_state["ai_insights"])
 
 
