@@ -18,6 +18,7 @@ st.set_page_config(
 
 KLAVIYO_API_KEY = os.environ.get("KLAVIYO_API_KEY", "")
 KLAVIYO_LIST_ID = os.environ.get("KLAVIYO_LIST_ID", "")
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 KLAVIYO_API_BASE = "https://a.klaviyo.com/api"
 KLAVIYO_REVISION = "2024-02-15"
 
@@ -408,6 +409,133 @@ def render_raw_data(df: pd.DataFrame):
 
 
 # ---------------------------------------------------------------------------
+# AI Insights (Claude via Anthropic API)
+# ---------------------------------------------------------------------------
+
+def build_data_summary(df: pd.DataFrame) -> str:
+    """Build a concise text snapshot of all quiz data for the AI prompt."""
+    total = len(df)
+    emails = int((df["email"] != "").sum()) if not df.empty else 0
+    completed = int(df["quiz_completed"].sum()) if not df.empty else 0
+
+    lines = [
+        "=== MenoQueen Quiz Data Snapshot ===",
+        f"Total profiles: {total}",
+        f"Emails captured: {emails} ({round(emails/total*100,1) if total else 0}%)",
+        f"Completed: {completed} ({round(completed/total*100,1) if total else 0}%)",
+        "",
+    ]
+
+    # Funnel with step-to-step drop-offs
+    funnel = compute_funnel(df)
+    if not funnel.empty:
+        lines.append("=== Funnel (step → count → drop-off from previous) ===")
+        prev = None
+        for _, row in funnel.iterrows():
+            drop = ""
+            if prev is not None and prev > 0:
+                lost = prev - row["count"]
+                drop = f"  (lost {lost}, -{round(lost/prev*100,1)}%)"
+            lines.append(f"  {row['label']}: {row['count']}{drop}")
+            prev = row["count"]
+        lines.append("")
+
+    # Answer distributions per question
+    lines.append("=== Answer Distributions ===")
+    for qk in QUIZ_Q_KEYS:
+        label = QUESTION_LABELS.get(qk, qk)
+        dist = compute_answer_distribution(df, qk)
+        if dist.empty:
+            continue
+        lines.append(f"\n{label} ({qk}):")
+        for _, r in dist.iterrows():
+            pct = round(r["count"] / total * 100, 1) if total else 0
+            lines.append(f"  {r['answer']}: {r['count']} ({pct}%)")
+
+    return "\n".join(lines)
+
+
+def get_claude_insights(summary: str) -> str:
+    """Call the Anthropic Messages API and return Claude's analysis."""
+    resp = requests.post(
+        "https://api.anthropic.com/v1/messages",
+        headers={
+            "x-api-key": ANTHROPIC_API_KEY,
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json",
+        },
+        json={
+            "model": "claude-sonnet-4-20250514",
+            "max_tokens": 1500,
+            "system": (
+                "You are a quiz funnel conversion analyst for MenoQueen, a menopause "
+                "supplement brand. You analyze quiz completion data and provide actionable "
+                "insights. Be specific, reference actual numbers from the data, and "
+                "prioritize recommendations by potential revenue impact. Keep your analysis "
+                "concise. Format with markdown headers (##) and bullet points."
+            ),
+            "messages": [
+                {
+                    "role": "user",
+                    "content": (
+                        "Analyze this quiz funnel data. Identify:\n"
+                        "1. The biggest drop-off points and likely causes\n"
+                        "2. Patterns in who completes vs. who drops off\n"
+                        "3. What the symptom/answer distributions reveal about the audience\n"
+                        "4. 3-5 specific, actionable recommendations to improve conversion\n\n"
+                        f"{summary}"
+                    ),
+                }
+            ],
+        },
+        timeout=60,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    # Extract text from the first content block
+    blocks = data.get("content", [])
+    return blocks[0]["text"] if blocks else "No response received."
+
+
+def render_ai_insights(df: pd.DataFrame):
+    """Render the AI Insights section with an on-demand Analyze button."""
+    st.subheader("AI Insights")
+
+    if not ANTHROPIC_API_KEY:
+        st.info(
+            "Add **ANTHROPIC_API_KEY** as an environment variable to enable "
+            "AI-powered drop-off analysis and recommendations."
+        )
+        return
+
+    if st.button("Analyze with Claude"):
+        with st.spinner("Claude is analyzing your quiz data..."):
+            try:
+                summary = build_data_summary(df)
+                insights = get_claude_insights(summary)
+                st.session_state["ai_insights"] = insights
+            except requests.exceptions.HTTPError as exc:
+                status = exc.response.status_code
+                if status == 401:
+                    st.error("Invalid Anthropic API key. Check your ANTHROPIC_API_KEY.")
+                elif status == 429:
+                    st.error("Rate limited by Anthropic API. Wait a moment and try again.")
+                else:
+                    st.error(f"Anthropic API error: {status} – {exc.response.text[:300]}")
+                return
+            except requests.exceptions.Timeout:
+                st.error("Claude API request timed out. Try again.")
+                return
+            except Exception as exc:
+                st.error(f"Unexpected error: {exc}")
+                return
+
+    # Display persisted result
+    if "ai_insights" in st.session_state:
+        st.markdown(st.session_state["ai_insights"])
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -441,6 +569,10 @@ def main():
 
     # -- KPIs --
     render_kpi_row(df)
+    st.divider()
+
+    # -- AI Insights (on-demand) --
+    render_ai_insights(df)
     st.divider()
 
     # -- Funnel (full step progression including result pages) --
