@@ -94,6 +94,17 @@ Q_DEMOGRAPHICS = ["quiz_q9", "quiz_q10", "quiz_q12"]
 
 
 def _pretty(value: str) -> str:
+    import re as _re
+    # Detect age-range patterns like "55_64", "65_69", "70_plus"
+    m = _re.match(r"^(\d{2})_(\d{2})$", value)
+    if m:
+        return f"{m.group(1)}–{m.group(2)}"
+    m = _re.match(r"^(\d{2})_plus$", value, _re.IGNORECASE)
+    if m:
+        return f"{m.group(1)}+"
+    m = _re.match(r"^under_(\d{2})$", value, _re.IGNORECASE)
+    if m:
+        return f"Under {m.group(1)}"
     return value.replace("_", " ").replace("-", " ").title()
 
 
@@ -1380,6 +1391,7 @@ def _render_question_chart(df: pd.DataFrame, col: str, title: str, chart_type: s
             height=300,
             showlegend=False, coloraxis_showscale=False,
             xaxis_title="", yaxis_title="Count",
+            xaxis=dict(type="category"),
         )
     else:
         return
