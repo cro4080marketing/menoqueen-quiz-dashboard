@@ -1,11 +1,15 @@
 import os
+import json
+import re
 from datetime import date, timedelta
+from collections import Counter
+from urllib.parse import urlparse, parse_qs
+
 import streamlit as st
 import requests
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
-from collections import Counter
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -17,13 +21,28 @@ st.set_page_config(
     layout="wide",
 )
 
+# Klaviyo
 KLAVIYO_API_KEY = os.environ.get("KLAVIYO_API_KEY", "")
 KLAVIYO_LIST_ID = os.environ.get("KLAVIYO_LIST_ID", "")
-ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 KLAVIYO_API_BASE = "https://a.klaviyo.com/api"
 KLAVIYO_REVISION = "2024-02-15"
 
-# Question labels mapped from the real Klaviyo property keys.
+# Anthropic (Claude AI insights)
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+
+# Google Analytics 4
+GA4_PROPERTY_ID = os.environ.get("GA4_PROPERTY_ID", "")
+GA4_CREDENTIALS_JSON = os.environ.get("GA4_CREDENTIALS_JSON", "")
+
+# Shopify
+SHOPIFY_STORE_DOMAIN = os.environ.get("SHOPIFY_STORE_DOMAIN", "")
+SHOPIFY_ACCESS_TOKEN = os.environ.get("SHOPIFY_ACCESS_TOKEN", "")
+SHOPIFY_API_VERSION = os.environ.get("SHOPIFY_API_VERSION", "2024-10")
+
+# ---------------------------------------------------------------------------
+# Quiz metadata
+# ---------------------------------------------------------------------------
+
 QUESTION_LABELS = {
     "quiz_q1": "Primary Symptom",
     "quiz_q2": "Symptom Frequency",
@@ -40,7 +59,6 @@ QUESTION_LABELS = {
 
 QUIZ_Q_KEYS = list(QUESTION_LABELS.keys())
 
-# Full ordered step list including result/educational pages.
 QUIZ_STEPS_ORDER = [
     "q1", "q2", "q3", "q4", "q5", "q6", "q7", "q8", "q9", "q10", "q12",
     "email-capture", "preparing-summary",
@@ -68,16 +86,20 @@ STEP_LABELS = {
     "product-recommendation": "Product Page",
 }
 
-# Prettify raw answer values for display.
+
 def _pretty(value: str) -> str:
     return value.replace("_", " ").replace("-", " ").title()
 
 
+# =========================================================================
+#  DATA SOURCES
+# =========================================================================
+
 # ---------------------------------------------------------------------------
-# API helpers
+# 1. Klaviyo
 # ---------------------------------------------------------------------------
 
-def _headers() -> dict:
+def _klaviyo_headers() -> dict:
     return {
         "Authorization": f"Klaviyo-API-Key {KLAVIYO_API_KEY}",
         "revision": KLAVIYO_REVISION,
@@ -87,46 +109,32 @@ def _headers() -> dict:
 
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_quiz_profiles() -> list[dict]:
-    """Fetch quiz profiles from Klaviyo.
-
-    Uses the list endpoint when KLAVIYO_LIST_ID is set (recommended),
-    otherwise falls back to fetching all profiles.
-    Handles cursor-based pagination.
-    """
+    """Fetch quiz profiles from Klaviyo (paginated)."""
     profiles: list[dict] = []
-
     if KLAVIYO_LIST_ID:
         url = f"{KLAVIYO_API_BASE}/lists/{KLAVIYO_LIST_ID}/profiles/"
     else:
         url = f"{KLAVIYO_API_BASE}/profiles/"
-
     params: dict = {"page[size]": 100}
 
     while url:
-        resp = requests.get(url, headers=_headers(), params=params, timeout=30)
+        resp = requests.get(url, headers=_klaviyo_headers(), params=params, timeout=30)
         resp.raise_for_status()
         payload = resp.json()
         profiles.extend(payload.get("data", []))
-
         next_link = payload.get("links", {}).get("next")
-        if next_link:
-            url = next_link
-            params = {}
-        else:
-            url = None
+        url = next_link if next_link else None
+        params = {} if next_link else params
 
-    # When fetching without a list, keep only quiz profiles.
     if not KLAVIYO_LIST_ID:
         profiles = [
             p for p in profiles
             if p.get("attributes", {}).get("properties", {}).get("quiz_source") == "menoqueen_quiz"
         ]
-
     return profiles
 
 
 def profiles_to_dataframe(profiles: list[dict]) -> pd.DataFrame:
-    """Flatten Klaviyo profile JSON into a tidy DataFrame."""
     rows = []
     for p in profiles:
         attrs = p.get("attributes", {})
@@ -141,7 +149,6 @@ def profiles_to_dataframe(profiles: list[dict]) -> pd.DataFrame:
         for qk in QUIZ_Q_KEYS:
             row[qk] = props.get(qk, "")
         rows.append(row)
-
     df = pd.DataFrame(rows)
     if not df.empty and "created" in df.columns:
         df["created"] = pd.to_datetime(df["created"], errors="coerce", utc=True)
@@ -149,11 +156,144 @@ def profiles_to_dataframe(profiles: list[dict]) -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------------------
-# Metric helpers
+# 2. Google Analytics 4
 # ---------------------------------------------------------------------------
 
+def _ga4_available() -> bool:
+    return bool(GA4_PROPERTY_ID and GA4_CREDENTIALS_JSON)
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_ga4_step_pageviews(start_date: str = "30daysAgo", end_date: str = "today") -> dict:
+    """Query GA4 for pageviews per quiz step.
+
+    Returns dict like {"q1": 500, "q2": 420, "email-capture": 310, ...}.
+    """
+    from google.oauth2 import service_account
+    from google.analytics.data_v1beta import BetaAnalyticsDataClient
+    from google.analytics.data_v1beta.types import (
+        DateRange, Dimension, Filter, FilterExpression, Metric, RunReportRequest,
+    )
+
+    creds = service_account.Credentials.from_service_account_info(
+        json.loads(GA4_CREDENTIALS_JSON)
+    )
+    client = BetaAnalyticsDataClient(credentials=creds)
+
+    request = RunReportRequest(
+        property=f"properties/{GA4_PROPERTY_ID}",
+        date_ranges=[DateRange(start_date=start_date, end_date=end_date)],
+        dimensions=[Dimension(name="pagePathPlusQueryString")],
+        metrics=[Metric(name="screenPageViews")],
+        dimension_filter=FilterExpression(
+            filter=Filter(
+                field_name="pagePath",
+                string_filter=Filter.StringFilter(
+                    match_type=Filter.StringFilter.MatchType.CONTAINS,
+                    value="/pages/quiz-1",
+                ),
+            )
+        ),
+    )
+    response = client.run_report(request)
+
+    step_counts: dict[str, int] = {}
+    for row in response.rows:
+        url_path = row.dimension_values[0].value
+        views = int(row.metric_values[0].value)
+        # Extract ?step= parameter from the URL path
+        match = re.search(r"[?&]step=([^&]+)", url_path)
+        if match:
+            step = match.group(1)
+        else:
+            step = "q1"  # Landing on the quiz page without ?step= means Q1
+        step_counts[step] = step_counts.get(step, 0) + views
+
+    return step_counts
+
+
+# ---------------------------------------------------------------------------
+# 3. Shopify
+# ---------------------------------------------------------------------------
+
+def _shopify_available() -> bool:
+    return bool(SHOPIFY_STORE_DOMAIN and SHOPIFY_ACCESS_TOKEN)
+
+
+def _shopify_headers() -> dict:
+    return {
+        "X-Shopify-Access-Token": SHOPIFY_ACCESS_TOKEN,
+        "Content-Type": "application/json",
+    }
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_shopify_orders(days_back: int = 60) -> list[dict]:
+    """Fetch recent Shopify orders (paginated via Link header)."""
+    orders: list[dict] = []
+    since = (date.today() - timedelta(days=days_back)).isoformat() + "T00:00:00Z"
+    url = f"https://{SHOPIFY_STORE_DOMAIN}/admin/api/{SHOPIFY_API_VERSION}/orders.json"
+    params: dict = {
+        "status": "any",
+        "created_at_min": since,
+        "limit": 250,
+    }
+
+    while url:
+        resp = requests.get(url, headers=_shopify_headers(), params=params, timeout=30)
+        resp.raise_for_status()
+        orders.extend(resp.json().get("orders", []))
+
+        # Shopify uses Link header for pagination
+        link_header = resp.headers.get("Link", "")
+        next_match = re.search(r'<([^>]+)>;\s*rel="next"', link_header)
+        if next_match:
+            url = next_match.group(1)
+            params = {}
+        else:
+            url = None
+
+    return orders
+
+
+def compute_shopify_metrics(orders: list[dict]) -> dict:
+    """Compute summary metrics from a list of Shopify orders."""
+    total = len(orders)
+    revenue = sum(float(o.get("total_price", 0)) for o in orders)
+
+    subscription = 0
+    onetime = 0
+    coupon_counts: dict[str, int] = {}
+
+    for o in orders:
+        is_sub = any(
+            item.get("selling_plan_allocation")
+            for item in o.get("line_items", [])
+        )
+        if is_sub:
+            subscription += 1
+        else:
+            onetime += 1
+
+        for dc in o.get("discount_codes", []):
+            code = dc.get("code", "").upper()
+            coupon_counts[code] = coupon_counts.get(code, 0) + 1
+
+    return {
+        "total_orders": total,
+        "revenue": revenue,
+        "subscription": subscription,
+        "onetime": onetime,
+        "sub_pct": round(subscription / total * 100, 1) if total else 0,
+        "coupon_counts": coupon_counts,
+    }
+
+
+# =========================================================================
+#  METRIC HELPERS
+# =========================================================================
+
 def compute_answer_distribution(df: pd.DataFrame, col: str) -> pd.DataFrame:
-    """Count occurrences of each answer value for a given quiz column."""
     vals = df[col].dropna().astype(str)
     vals = vals[vals != ""]
     items: list[str] = []
@@ -168,23 +308,13 @@ def compute_answer_distribution(df: pd.DataFrame, col: str) -> pd.DataFrame:
 
 
 def compute_funnel(df: pd.DataFrame) -> pd.DataFrame:
-    """Estimate how many users reached each step or beyond.
-
-    For profiles where quiz_current_step is empty we infer progress from which
-    quiz answer fields are populated.  Completed profiles are placed at the
-    final step.
-    """
     step_index = {s: i for i, s in enumerate(QUIZ_STEPS_ORDER)}
     q_steps = [s for s in QUIZ_STEPS_ORDER if s.startswith("q")]
 
     def infer_rank(row):
-        # Explicit current_step wins.
         explicit = step_index.get(row.get("current_step", ""), -1)
         if explicit >= 0:
             return explicit
-
-        # Infer from answered questions: the last answered question tells us
-        # the user reached at least that step.
         best = -1
         for qs in q_steps:
             val = row.get(qs, "")
@@ -192,7 +322,6 @@ def compute_funnel(df: pd.DataFrame) -> pd.DataFrame:
                 rank = step_index.get(qs, -1)
                 if rank > best:
                     best = rank
-        # If they have an email, they passed email-capture.
         if row.get("email", "") and best >= 0:
             ec_rank = step_index.get("email-capture", best)
             if ec_rank > best:
@@ -204,8 +333,6 @@ def compute_funnel(df: pd.DataFrame) -> pd.DataFrame:
 
     df = df.copy()
     df["step_rank"] = df.apply(infer_rank, axis=1)
-
-    # Completed profiles made it through the entire funnel.
     last_rank = len(QUIZ_STEPS_ORDER) - 1
     df.loc[df["quiz_completed"] == True, "step_rank"] = last_rank  # noqa: E712
 
@@ -223,9 +350,9 @@ def compute_funnel(df: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(records)
 
 
-# ---------------------------------------------------------------------------
-# UI components
-# ---------------------------------------------------------------------------
+# =========================================================================
+#  UI COMPONENTS
+# =========================================================================
 
 def render_api_missing():
     st.error("**KLAVIYO_API_KEY** environment variable is not set.")
@@ -263,9 +390,58 @@ def render_kpi_row(df: pd.DataFrame):
     )
 
 
+def render_shopify_kpis(metrics: dict):
+    """Render Shopify revenue KPI row."""
+    st.subheader("Shopify Revenue")
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Orders", f"{metrics['total_orders']:,}")
+    c2.metric("Revenue", f"${metrics['revenue']:,.2f}")
+    c3.metric("Subscription %", f"{metrics['sub_pct']}%")
+    top_coupon = ""
+    if metrics["coupon_counts"]:
+        top_code = max(metrics["coupon_counts"], key=metrics["coupon_counts"].get)
+        top_coupon = f"{top_code}: {metrics['coupon_counts'][top_code]}"
+    c4.metric("Top Coupon", top_coupon or "None")
+
+
+def render_ga4_funnel(step_counts: dict):
+    """Bar chart of GA4 pageviews per quiz step."""
+    st.subheader("Full Funnel - Google Analytics (pageviews)")
+    # Build ordered data
+    records = []
+    for step_id in QUIZ_STEPS_ORDER:
+        views = step_counts.get(step_id, 0)
+        records.append({
+            "step": step_id,
+            "label": STEP_LABELS.get(step_id, step_id),
+            "pageviews": views,
+        })
+    ga_df = pd.DataFrame(records)
+    ga_df = ga_df[ga_df["pageviews"] > 0]
+
+    if ga_df.empty:
+        st.info("No GA4 pageview data for quiz steps yet.")
+        return
+
+    colors = px.colors.sequential.Purples_r
+    n = len(ga_df)
+    palette = (colors * ((n // len(colors)) + 1))[:n]
+
+    fig = go.Figure(go.Funnel(
+        y=ga_df["label"],
+        x=ga_df["pageviews"],
+        textinfo="value+percent initial",
+        marker=dict(color=palette),
+    ))
+    fig.update_layout(
+        margin=dict(l=20, r=20, t=10, b=10),
+        height=max(350, n * 32),
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+
 def render_funnel(df: pd.DataFrame):
-    """Full quiz funnel including question, email, result, and product steps."""
-    st.subheader("Quiz Funnel")
+    st.subheader("Quiz Funnel - Klaviyo (post-email)")
     funnel = compute_funnel(df)
     if funnel.empty:
         st.info("No funnel data yet.")
@@ -289,7 +465,6 @@ def render_funnel(df: pd.DataFrame):
 
 
 def render_primary_symptom_chart(df: pd.DataFrame):
-    """Horizontal bar chart of Q1 primary symptom answers."""
     st.subheader("Primary Symptom (Q1)")
     dist = compute_answer_distribution(df, "quiz_q1")
     if dist.empty:
@@ -309,7 +484,6 @@ def render_primary_symptom_chart(df: pd.DataFrame):
 
 
 def render_menopause_stage_chart(df: pd.DataFrame):
-    """Donut chart of Q9 menopause stage."""
     st.subheader("Menopause Stage (Q9)")
     dist = compute_answer_distribution(df, "quiz_q9")
     if dist.empty:
@@ -317,15 +491,13 @@ def render_menopause_stage_chart(df: pd.DataFrame):
         return
     fig = px.pie(
         dist, values="count", names="answer",
-        color_discrete_sequence=px.colors.sequential.Purples_r,
-        hole=0.4,
+        color_discrete_sequence=px.colors.sequential.Purples_r, hole=0.4,
     )
     fig.update_layout(margin=dict(l=20, r=20, t=10, b=10), height=300)
     st.plotly_chart(fig, use_container_width=True)
 
 
 def render_age_range_chart(df: pd.DataFrame):
-    """Bar chart of Q10 age range."""
     st.subheader("Age Range (Q10)")
     dist = compute_answer_distribution(df, "quiz_q10")
     if dist.empty:
@@ -344,7 +516,6 @@ def render_age_range_chart(df: pd.DataFrame):
 
 
 def render_relief_status_chart(df: pd.DataFrame):
-    """Donut chart of Q12 relief status."""
     st.subheader("Relief Status (Q12)")
     dist = compute_answer_distribution(df, "quiz_q12")
     if dist.empty:
@@ -352,15 +523,13 @@ def render_relief_status_chart(df: pd.DataFrame):
         return
     fig = px.pie(
         dist, values="count", names="answer",
-        color_discrete_sequence=px.colors.sequential.Purples_r,
-        hole=0.4,
+        color_discrete_sequence=px.colors.sequential.Purples_r, hole=0.4,
     )
     fig.update_layout(margin=dict(l=20, r=20, t=10, b=10), height=300)
     st.plotly_chart(fig, use_container_width=True)
 
 
 def render_all_questions_breakdown(df: pd.DataFrame):
-    """Expandable section showing answer distributions for every question."""
     st.subheader("Full Question Breakdown")
     for qk in QUIZ_Q_KEYS:
         label = QUESTION_LABELS.get(qk, qk)
@@ -386,17 +555,10 @@ def render_daily_trend(df: pd.DataFrame):
     if df.empty or df["created"].isna().all():
         st.info("No time-series data available.")
         return
-
     daily = (
-        df.set_index("created")
-        .resample("D")
-        .size()
-        .reset_index(name="profiles")
+        df.set_index("created").resample("D").size().reset_index(name="profiles")
     )
-    fig = px.area(
-        daily, x="created", y="profiles",
-        color_discrete_sequence=["#8E44AD"],
-    )
+    fig = px.area(daily, x="created", y="profiles", color_discrete_sequence=["#8E44AD"])
     fig.update_layout(
         margin=dict(l=20, r=20, t=10, b=10), height=300,
         xaxis_title="", yaxis_title="New Profiles",
@@ -409,20 +571,56 @@ def render_raw_data(df: pd.DataFrame):
         st.dataframe(df, use_container_width=True, height=400)
 
 
-# ---------------------------------------------------------------------------
-# AI Insights (Claude via Anthropic API)
-# ---------------------------------------------------------------------------
+# =========================================================================
+#  AI INSIGHTS (Claude via Anthropic API)
+# =========================================================================
 
 def _filter_by_dates(df: pd.DataFrame, start: date, end: date) -> pd.DataFrame:
-    """Return rows whose `created` date falls within [start, end] inclusive."""
     if df.empty or df["created"].isna().all():
         return df
     mask = (df["created"].dt.date >= start) & (df["created"].dt.date <= end)
     return df.loc[mask]
 
 
-def build_data_summary(df: pd.DataFrame, label: str = "") -> str:
-    """Build a concise text snapshot of a (possibly filtered) DataFrame."""
+def _ga4_summary_block(ga4_steps: dict) -> str:
+    """Format GA4 step pageviews as a text block for the AI prompt."""
+    lines = ["", "Google Analytics Funnel (pageviews per step):"]
+    prev = None
+    for step_id in QUIZ_STEPS_ORDER:
+        views = ga4_steps.get(step_id, 0)
+        if views == 0:
+            continue
+        drop = ""
+        if prev is not None and prev > 0:
+            lost = prev - views
+            drop = f"  (lost {lost}, -{round(lost/prev*100,1)}%)"
+        lines.append(f"  {STEP_LABELS.get(step_id, step_id)}: {views}{drop}")
+        prev = views
+    return "\n".join(lines)
+
+
+def _shopify_summary_block(metrics: dict) -> str:
+    """Format Shopify metrics as a text block for the AI prompt."""
+    lines = [
+        "",
+        "Shopify Revenue:",
+        f"  Total orders: {metrics['total_orders']}",
+        f"  Revenue: ${metrics['revenue']:,.2f}",
+        f"  Subscription orders: {metrics['subscription']} ({metrics['sub_pct']}%)",
+        f"  One-time orders: {metrics['onetime']}",
+    ]
+    for code, count in metrics.get("coupon_counts", {}).items():
+        lines.append(f"  Coupon {code}: {count} orders")
+    return "\n".join(lines)
+
+
+def build_data_summary(
+    df: pd.DataFrame,
+    label: str = "",
+    ga4_steps: dict | None = None,
+    shopify_metrics: dict | None = None,
+) -> str:
+    """Build a concise text snapshot including all available data sources."""
     total = len(df)
     emails = int((df["email"] != "").sum()) if not df.empty else 0
     completed = int(df["quiz_completed"].sum()) if not df.empty else 0
@@ -436,10 +634,15 @@ def build_data_summary(df: pd.DataFrame, label: str = "") -> str:
         "",
     ]
 
-    # Funnel with step-to-step drop-offs
+    # GA4 funnel (anonymous visitors)
+    if ga4_steps:
+        lines.append(_ga4_summary_block(ga4_steps))
+        lines.append("")
+
+    # Klaviyo funnel (post-email)
     funnel = compute_funnel(df)
     if not funnel.empty:
-        lines.append("Funnel (step | count | drop-off from previous):")
+        lines.append("Klaviyo Funnel (step | count | drop-off from previous):")
         prev = None
         for _, row in funnel.iterrows():
             drop = ""
@@ -450,7 +653,12 @@ def build_data_summary(df: pd.DataFrame, label: str = "") -> str:
             prev = row["count"]
         lines.append("")
 
-    # Answer distributions per question
+    # Shopify revenue
+    if shopify_metrics:
+        lines.append(_shopify_summary_block(shopify_metrics))
+        lines.append("")
+
+    # Answer distributions
     lines.append("Answer Distributions:")
     for qk in QUIZ_Q_KEYS:
         qlabel = QUESTION_LABELS.get(qk, qk)
@@ -469,25 +677,27 @@ def build_comparison_summary(
     df: pd.DataFrame,
     start_a: date, end_a: date,
     start_b: date, end_b: date,
+    ga4_steps_a: dict | None = None,
+    ga4_steps_b: dict | None = None,
+    shopify_metrics_a: dict | None = None,
+    shopify_metrics_b: dict | None = None,
 ) -> str:
-    """Build side-by-side summaries for two date ranges."""
     df_a = _filter_by_dates(df, start_a, end_a)
     df_b = _filter_by_dates(df, start_b, end_b)
     label_a = f"PERIOD A: {start_a.strftime('%b %d')} – {end_a.strftime('%b %d, %Y')} ({len(df_a)} profiles)"
     label_b = f"PERIOD B: {start_b.strftime('%b %d')} – {end_b.strftime('%b %d, %Y')} ({len(df_b)} profiles)"
-    return build_data_summary(df_a, label_a) + "\n\n" + build_data_summary(df_b, label_b)
+    summary_a = build_data_summary(df_a, label_a, ga4_steps=ga4_steps_a, shopify_metrics=shopify_metrics_a)
+    summary_b = build_data_summary(df_b, label_b, ga4_steps=ga4_steps_b, shopify_metrics=shopify_metrics_b)
+    return summary_a + "\n\n" + summary_b
 
 
-def get_claude_insights(
-    summary: str,
-    mode: str = "snapshot",
-    custom_question: str = "",
-) -> str:
-    """Call the Anthropic Messages API and return Claude's analysis."""
+def get_claude_insights(summary: str, mode: str = "snapshot", custom_question: str = "") -> str:
     system_prompt = (
         "You are a quiz funnel conversion analyst for MenoQueen, a menopause "
-        "supplement brand. You analyze quiz completion data and provide actionable "
-        "insights. Be specific, reference actual numbers from the data, and "
+        "supplement brand. You have access to data from three sources: "
+        "Google Analytics (anonymous pageviews per step), Klaviyo (post-email "
+        "quiz profiles and answer data), and Shopify (orders and revenue). "
+        "Be specific, reference actual numbers from the data, and "
         "prioritize recommendations by potential revenue impact. Keep your analysis "
         "concise. Format with markdown headers (##) and bullet points."
     )
@@ -498,22 +708,24 @@ def get_claude_insights(
             "Period A is the BASELINE (the earlier / 'good' period).\n"
             "Period B is the RECENT period (the one the client is concerned about).\n\n"
             "Identify:\n"
-            "1. Key metric changes between the periods (completion rate, email capture rate, drop-off shifts)\n"
+            "1. Key metric changes between the periods (completion rate, email capture rate, drop-off shifts, revenue changes)\n"
             "2. Which funnel steps got worse (or better) and by how much\n"
             "3. Any shifts in answer distributions that could explain behaviour changes\n"
-            "4. 3-5 specific, prioritised recommendations to fix any declines\n\n"
+            "4. Revenue impact — did order volume or subscription rates change?\n"
+            "5. 3-5 specific, prioritised recommendations to fix any declines\n\n"
         )
     else:
         user_content = (
             "Analyze this quiz funnel data. Identify:\n"
-            "1. The biggest drop-off points and likely causes\n"
+            "1. The biggest drop-off points and likely causes (use GA4 data for pre-email, Klaviyo for post-email)\n"
             "2. Patterns in who completes vs. who drops off\n"
             "3. What the symptom/answer distributions reveal about the audience\n"
-            "4. 3-5 specific, actionable recommendations to improve conversion\n\n"
+            "4. Revenue insights from Shopify (if available)\n"
+            "5. 3-5 specific, actionable recommendations to improve conversion\n\n"
         )
 
     if custom_question:
-        user_content += f"The client specifically wants to know: \"{custom_question}\"\n\n"
+        user_content += f'The client specifically wants to know: "{custom_question}"\n\n'
 
     user_content += summary
 
@@ -526,7 +738,7 @@ def get_claude_insights(
         },
         json={
             "model": "claude-sonnet-4-20250514",
-            "max_tokens": 2000,
+            "max_tokens": 2500,
             "system": system_prompt,
             "messages": [{"role": "user", "content": user_content}],
         },
@@ -539,7 +751,6 @@ def get_claude_insights(
 
 
 def _run_analysis(summary: str, mode: str, custom_question: str):
-    """Shared helper: call Claude and store result (or show error)."""
     try:
         insights = get_claude_insights(summary, mode=mode, custom_question=custom_question)
         st.session_state["ai_insights"] = insights
@@ -557,8 +768,12 @@ def _run_analysis(summary: str, mode: str, custom_question: str):
         st.error(f"Unexpected error: {exc}")
 
 
-def render_ai_insights(df: pd.DataFrame):
-    """Render AI Insights with Snapshot and Comparison modes."""
+def render_ai_insights(
+    df: pd.DataFrame,
+    ga4_steps: dict | None = None,
+    shopify_metrics: dict | None = None,
+):
+    """Render AI Insights with Snapshot and Comparison modes, fed by all sources."""
     st.subheader("AI Insights")
 
     if not ANTHROPIC_API_KEY:
@@ -568,11 +783,16 @@ def render_ai_insights(df: pd.DataFrame):
         )
         return
 
+    # Show which data sources are active
+    sources = ["Klaviyo"]
+    if ga4_steps:
+        sources.append("GA4")
+    if shopify_metrics:
+        sources.append("Shopify")
+    st.caption(f"Data sources: {', '.join(sources)}")
+
     mode = st.radio(
-        "Analysis type",
-        ["Snapshot", "Comparison"],
-        horizontal=True,
-        key="ai_mode",
+        "Analysis type", ["Snapshot", "Comparison"], horizontal=True, key="ai_mode",
     )
 
     today = date.today()
@@ -599,11 +819,12 @@ def render_ai_insights(df: pd.DataFrame):
                     summary = build_data_summary(
                         filtered,
                         f"{snap_start.strftime('%b %d')} – {snap_end.strftime('%b %d, %Y')} ({len(filtered)} profiles)",
+                        ga4_steps=ga4_steps,
+                        shopify_metrics=shopify_metrics,
                     )
                     _run_analysis(summary, "snapshot", custom_q)
 
     else:  # Comparison
-        # Quick presets
         st.caption("Quick presets")
         p1, p2, _ = st.columns([1, 1, 2])
         with p1:
@@ -622,32 +843,26 @@ def render_ai_insights(df: pd.DataFrame):
                 st.session_state["b_start"] = first_this
                 st.session_state["b_end"] = today
 
-        # Period A
         st.markdown("**Period A** (baseline / earlier)")
         a1, a2 = st.columns(2)
         with a1:
             a_start = st.date_input(
-                "Start", value=st.session_state.get("a_start", today - timedelta(days=14)),
-                key="a_start",
+                "Start", value=st.session_state.get("a_start", today - timedelta(days=14)), key="a_start",
             )
         with a2:
             a_end = st.date_input(
-                "End", value=st.session_state.get("a_end", today - timedelta(days=8)),
-                key="a_end",
+                "End", value=st.session_state.get("a_end", today - timedelta(days=8)), key="a_end",
             )
 
-        # Period B
         st.markdown("**Period B** (recent / concerning)")
         b1, b2 = st.columns(2)
         with b1:
             b_start = st.date_input(
-                "Start", value=st.session_state.get("b_start", today - timedelta(days=7)),
-                key="b_start",
+                "Start", value=st.session_state.get("b_start", today - timedelta(days=7)), key="b_start",
             )
         with b2:
             b_end = st.date_input(
-                "End", value=st.session_state.get("b_end", today),
-                key="b_end",
+                "End", value=st.session_state.get("b_end", today), key="b_end",
             )
 
         custom_q = st.text_input(
@@ -663,7 +878,21 @@ def render_ai_insights(df: pd.DataFrame):
                 if df_a.empty and df_b.empty:
                     st.warning("No profiles in either date range.")
                 else:
-                    summary = build_comparison_summary(df, a_start, a_end, b_start, b_end)
+                    # Fetch period-specific GA4 data if available
+                    ga4_a, ga4_b = None, None
+                    if _ga4_available():
+                        try:
+                            ga4_a = fetch_ga4_step_pageviews(a_start.isoformat(), a_end.isoformat())
+                            ga4_b = fetch_ga4_step_pageviews(b_start.isoformat(), b_end.isoformat())
+                        except Exception:
+                            pass  # Graceful — comparison works without GA4
+
+                    summary = build_comparison_summary(
+                        df, a_start, a_end, b_start, b_end,
+                        ga4_steps_a=ga4_a, ga4_steps_b=ga4_b,
+                        shopify_metrics_a=shopify_metrics,
+                        shopify_metrics_b=shopify_metrics,
+                    )
                     _run_analysis(summary, "comparison", custom_q)
 
     # Display persisted result
@@ -672,9 +901,9 @@ def render_ai_insights(df: pd.DataFrame):
         st.markdown(st.session_state["ai_insights"])
 
 
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
+# =========================================================================
+#  MAIN
+# =========================================================================
 
 def main():
     if not KLAVIYO_API_KEY:
@@ -682,6 +911,7 @@ def main():
 
     render_header()
 
+    # -- Fetch Klaviyo data (always required) --
     with st.spinner("Fetching quiz profiles from Klaviyo..."):
         try:
             profiles = fetch_quiz_profiles()
@@ -698,25 +928,45 @@ def main():
     df = profiles_to_dataframe(profiles)
 
     if df.empty:
-        st.warning(
-            "No quiz profiles found. Users may not have started the quiz yet, "
-            "or the list/filter returned no results."
-        )
+        st.warning("No quiz profiles found. Users may not have started the quiz yet.")
         st.stop()
+
+    # -- Fetch GA4 data (optional) --
+    ga4_steps = None
+    if _ga4_available():
+        try:
+            ga4_steps = fetch_ga4_step_pageviews()
+        except Exception as exc:
+            st.warning(f"GA4 data unavailable: {exc}")
+
+    # -- Fetch Shopify data (optional) --
+    shopify_orders = None
+    shopify_metrics = None
+    if _shopify_available():
+        try:
+            shopify_orders = fetch_shopify_orders()
+            shopify_metrics = compute_shopify_metrics(shopify_orders)
+        except Exception as exc:
+            st.warning(f"Shopify data unavailable: {exc}")
 
     # -- KPIs --
     render_kpi_row(df)
+    if shopify_metrics:
+        render_shopify_kpis(shopify_metrics)
     st.divider()
 
-    # -- AI Insights (on-demand) --
-    render_ai_insights(df)
+    # -- AI Insights (on-demand, fed by all sources) --
+    render_ai_insights(df, ga4_steps=ga4_steps, shopify_metrics=shopify_metrics)
     st.divider()
 
-    # -- Funnel (full step progression including result pages) --
+    # -- Funnels --
+    if ga4_steps:
+        render_ga4_funnel(ga4_steps)
+        st.divider()
     render_funnel(df)
     st.divider()
 
-    # -- Row 1: Primary symptom + Menopause stage --
+    # -- Charts --
     left, right = st.columns(2)
     with left:
         render_primary_symptom_chart(df)
@@ -725,7 +975,6 @@ def main():
 
     st.divider()
 
-    # -- Row 2: Age range + Relief status --
     left2, right2 = st.columns(2)
     with left2:
         render_age_range_chart(df)
@@ -734,17 +983,12 @@ def main():
 
     st.divider()
 
-    # -- Daily trend --
     render_daily_trend(df)
-
     st.divider()
 
-    # -- Full question breakdown --
     render_all_questions_breakdown(df)
-
     st.divider()
 
-    # -- Raw data --
     render_raw_data(df)
 
 
