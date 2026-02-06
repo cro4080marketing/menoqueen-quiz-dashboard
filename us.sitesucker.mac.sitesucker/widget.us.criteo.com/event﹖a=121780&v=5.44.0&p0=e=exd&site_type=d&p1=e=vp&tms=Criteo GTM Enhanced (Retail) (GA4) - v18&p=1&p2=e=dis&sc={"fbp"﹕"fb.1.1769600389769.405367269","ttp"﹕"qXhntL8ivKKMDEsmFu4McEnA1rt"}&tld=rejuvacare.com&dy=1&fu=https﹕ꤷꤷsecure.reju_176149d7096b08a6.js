@@ -1,0 +1,2 @@
+﻿/*<!--*/var cspDomains="undefined"!=typeof ["criteo.com","criteo.net","crto.in","localhost","127.0.0.1","hlserve.com","ctolabperfstats.com"]?["criteo.com","criteo.net","crto.in","localhost","127.0.0.1","hlserve.com","ctolabperfstats.com"]:[];window.cto_csm_CspLogger&&"function"==typeof window.cto_csm_CspLogger.addAllowedDomains&&window.cto_csm_CspLogger.addAllowedDomains(cspDomains);
+/*-->*/
